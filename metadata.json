@@ -1,0 +1,6 @@
+{
+  "name": "Manga AI",
+  "description": "An intelligent manga reader that uses Gemini AI to auto-extract manga data from any website.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
