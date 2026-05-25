@@ -1,143 +1,98 @@
 package com.example.data.remote
 
-import android.util.Log
-import com.example.BuildConfig
-import com.example.data.security.SecurityManager
-import com.example.domain.model.Manga
-import com.example.domain.model.MangaSource
+import android.content.Context
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.*
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import java.net.URI
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import android.util.Log
 
-class MangaScraperService(
-    private val securityManager: SecurityManager,
-    private val apiService: GeminiApiService = RetrofitClient.geminiService
-) {
+class MangaScraperService(private val context: Context) {
+    private val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    private fun getApiKey(): String {
-        return securityManager.getGeminiApiKey()?.takeIf { it.isNotBlank() } ?: BuildConfig.GEMINI_API_KEY
+    suspend fun parseMangaSite(url: String): Document? = withContext(Dispatchers.IO) {
+        var doc: Document? = null
+        var attempts = 0
+        val maxRetries = 3
+
+        while (attempts < maxRetries) {
+            try {
+                // Jsoup timeout 30s as requested
+                doc = withTimeoutOrNull(35_000) {
+                    Jsoup.connect(url)
+                        .userAgent(desktopUserAgent)
+                        .timeout(30_000)
+                        .get()
+                }
+                if (doc != null) break
+            } catch (e: Exception) {
+                Log.e("Scraper", "Jsoup attempt ${attempts + 1} failed: ${e.message}")
+                attempts++
+                if (attempts < maxRetries) delay(1000)
+            }
+        }
+
+        if (doc == null) {
+            Log.w("Scraper", "Jsoup failed after max retries. Falling back to WebView.")
+            // Fallback to WebView in Dispatchers.Main
+            val html = fetchWithWebViewFallback(url)
+            if (html != null) {
+                doc = Jsoup.parse(html)
+            }
+        }
+        
+        doc
     }
 
-    suspend fun getMangaData(url: String, sourceId: String): Manga = withContext(Dispatchers.IO) {
-        val html = fetchAndCleanHtml(url)
-        val prompt = "Extract manga details from this HTML: $html"
+    private suspend fun fetchWithWebViewFallback(url: String): String? = withContext(Dispatchers.Main) {
+        suspendCoroutine { continuation ->
+            var resumed = false
+            try {
+                val webView = WebView(context)
+                val settings: WebSettings = webView.settings
+                settings.javaScriptEnabled = true
+                settings.userAgentString = desktopUserAgent
+                settings.domStorageEnabled = true
 
-        val schema = buildJsonObject {
-            put("type", "OBJECT")
-            putJsonObject("properties") {
-                putJsonObject("title") { put("type", "STRING") }
-                putJsonObject("description") { put("type", "STRING") }
-                putJsonObject("coverUrl") { put("type", "STRING") }
-                putJsonObject("chapters") {
-                    put("type", "ARRAY")
-                    putJsonObject("items") {
-                        put("type", "OBJECT")
-                        putJsonObject("properties") {
-                            putJsonObject("title") { put("type", "STRING") }
-                            putJsonObject("url") { put("type", "STRING") }
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        view?.evaluateJavascript(
+                            "(function() { return '<html>'+document.getElementsByTagName('html')[0].innerHTML+'</html>'; })();"
+                        ) { htmlString ->
+                            if (!resumed) {
+                                resumed = true
+                                val unescaped = htmlString?.removeSurrounding("\"")
+                                    ?.replace("\\u003C", "<")
+                                    ?.replace("\\\"", "\"")
+                                continuation.resume(unescaped)
+                            }
                         }
-                        putJsonArray("required") { add("title"); add("url") }
                     }
                 }
+                webView.loadUrl(url)
+                
+                webView.postDelayed({
+                    if (!resumed) {
+                        resumed = true
+                        Log.e("Scraper", "WebView timeout")
+                        continuation.resume(null)
+                    }
+                }, 30_000)
+
+            } catch (e: Exception) {
+                if (!resumed) {
+                    resumed = true
+                    continuation.resume(null)
+                }
             }
-            putJsonArray("required") { add("title"); add("description"); add("coverUrl"); add("chapters") }
-        }
-
-        val request = GenerateContentRequest(
-            systemInstruction = Content(listOf(Part("You are a strict data extraction tool. Based on the provided raw HTML, extract the manga details. Do not inject conversational text. Return only valid JSON according to the schema. Ensure relative URLs are formatted or just capture what's there."))),
-            contents = listOf(Content(listOf(Part(text = prompt)))),
-            generationConfig = GenerationConfig(
-                responseFormat = ResponseFormat(
-                    text = ResponseFormatText(
-                        mimeType = "application/json",
-                        schema = schema
-                    )
-                ),
-                temperature = 0.0f
-            )
-        )
-
-        val response = apiService.generateContent(getApiKey(), request)
-        val jsonText = response.candidates.firstOrNull()?.content?.parts?.firstOrNull()?.text
-            ?: throw Exception("Empty response from AI")
-
-        val jsonObject = Json.parseToJsonElement(jsonText).jsonObject
-        val title = jsonObject["title"]?.jsonPrimitive?.content ?: "Unknown"
-        val desc = jsonObject["description"]?.jsonPrimitive?.content ?: ""
-        var cover = jsonObject["coverUrl"]?.jsonPrimitive?.content ?: ""
-        if (cover.startsWith("/")) {
-            val uri = URI(url)
-            val baseHost = "${uri.scheme}://${uri.host}"
-            cover = "$baseHost$cover"
-        }
-
-        val chaptersList = jsonObject["chapters"]?.jsonArray?.toString() ?: "[]"
-        
-        Manga(
-            id = url,
-            title = title,
-            description = desc,
-            coverUrl = cover,
-            sourceId = sourceId,
-            chaptersListJson = chaptersList
-        )
-    }
-    
-    suspend fun extractSourceInfo(url: String): MangaSource = withContext(Dispatchers.IO) {
-        val uri = URI(url)
-        val baseUrl = "${uri.scheme}://${uri.host}"
-        
-        val html = fetchAndCleanHtml(url)
-        val prompt = "Extract the general name of this manga website from this HTML: $html"
-        
-        val schema = buildJsonObject {
-            put("type", "OBJECT")
-            putJsonObject("properties") {
-                putJsonObject("name") { put("type", "STRING") }
-            }
-            putJsonArray("required") { add("name") }
-        }
-
-        val request = GenerateContentRequest(
-            contents = listOf(Content(listOf(Part(text = prompt)))),
-            generationConfig = GenerationConfig(
-                responseFormat = ResponseFormat(
-                    text = ResponseFormatText(
-                        mimeType = "application/json",
-                        schema = schema
-                    )
-                ),
-                temperature = 0.0f
-            )
-        )
-
-        val response = apiService.generateContent(getApiKey(), request)
-        val jsonText = response.candidates.firstOrNull()?.content?.parts?.firstOrNull()?.text
-            ?: throw Exception("Empty response from AI")
-            
-        val jsonObject = Json.parseToJsonElement(jsonText).jsonObject
-        val name = jsonObject["name"]?.jsonPrimitive?.content ?: uri.host
-
-        MangaSource(id = baseUrl, name = name, baseUrl = baseUrl, status = "CUSTOM")
-    }
-
-    private suspend fun fetchAndCleanHtml(url: String): String = withContext(Dispatchers.IO) {
-        try {
-            val doc: Document = Jsoup.connect(url)
-                .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
-                .header("Referer", url)
-                .get()
-
-            doc.select("script, style, noscript, iframe, header, footer, nav, svg").remove()
-            val text = doc.outerHtml().replace(Regex("\\s+"), " ")
-            // Trim to max characters to avoid overwhelming token limits
-            text.take(30000)
-        } catch (e: Exception) {
-            Log.e("MangaScraper", "Error fetching HTML", e)
-            throw Exception("Network error or invalid URL: ${e.message}")
         }
     }
 }
